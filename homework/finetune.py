@@ -180,6 +180,8 @@ def train(
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
+        max_grad_norm=1.0, #added
+        warmup_ratio=0.1, #added
         report_to="tensorboard",
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,

@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
@@ -101,8 +102,17 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+
+        # Determine encoder output dimensions from their configs
+        vision_dim = vision_encoder.config.hidden_size
+        text_dim = text_encoder.config.hidden_size
+
+        # Projection heads map each encoder's output to the shared proj_dim space
+        self.vision_projection = nn.Linear(vision_dim, proj_dim, bias=False)
+        self.text_projection = nn.Linear(text_dim, proj_dim, bias=False)
+
+        # Learnable temperature parameter (log scale for numerical stability)
+        self.log_temperature = nn.Parameter(torch.tensor(temperature).log())
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(image)
@@ -170,17 +180,46 @@ class CLIP(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the CLIP model.
-        Args:
-            pixel_values: The pixel values of the image.
-            input_ids: The input ids of the text.
-            attention_mask: The attention mask of the text.
-            labels: The labels for the text features.
-            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
+
         Returns:
-            TODO: think about the what values should be returned
+            vision_features: L2-normalized image embeddings (B, proj_dim)
+            text_features:   L2-normalized text embeddings  (B, proj_dim)
+            log_temperature: scalar learnable temperature
         """
-        raise NotImplementedError("Not implemented")
+        # --- Vision encoding ---
+        # Returns BaseModelOutput; mean-pool all patch tokens to get image representation.
+        vision_out = self.vision_encoder(pixel_values=pixel_values)
+        # last_hidden_state: (B, num_patches, vision_dim) -> mean pool -> (B, vision_dim)
+        vision_feat = vision_out.last_hidden_state.mean(dim=1)
+
+        # --- Text encoding ---
+        # text_encoder is the SmolLM decoder used as a feature extractor.
+        # We take the last non-padding token as the sentence representation.
+        text_out = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        hidden_states = text_out.last_hidden_state  # (B, seq_len, text_dim)
+
+        # Use the last real (non-padding) token per sequence
+        if attention_mask is not None:
+            # sum mask to get lengths, then pick last real token index
+            seq_lengths = attention_mask.sum(dim=1) - 1  # (B,)
+            seq_lengths = seq_lengths.clamp(min=0)
+            batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
+            text_feat = hidden_states[batch_idx, seq_lengths]  # (B, text_dim)
+        else:
+            text_feat = hidden_states[:, -1]  # fallback: last token
+
+        # --- Project to shared embedding space ---
+        vision_feat = self.vision_projection(vision_feat.to(self.vision_projection.weight.dtype))
+        text_feat = self.text_projection(text_feat.to(self.text_projection.weight.dtype))
+
+        # --- L2 normalize so dot product == cosine similarity ---
+        vision_feat = F.normalize(vision_feat, dim=-1)
+        text_feat = F.normalize(text_feat, dim=-1)
+
+        return vision_feat, text_feat, self.log_temperature
 
 
 def compute_clip_loss(
@@ -189,17 +228,29 @@ def compute_clip_loss(
     num_items_in_batch: int | None = None,
 ) -> torch.Tensor:
     """
-    Compute the loss for the CLIP model.
-    Args:
-        outputs: A tuple containing the outputs of CLIP.forward().
-        labels: The labels for the text features.
-        (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-        num_items_in_batch: The number of items in the batch.
-        (NOTE: you don't need to use the variable `num_items_in_batch`, this is just for compatibility with Trainer)
-    Returns:
-        The loss for the CLIP model.
+    Symmetric InfoNCE (contrastive) loss.
+
+    For a batch of N (image, caption) pairs the NxN similarity matrix should
+    be maximised along the diagonal (matching pairs) and minimised elsewhere.
     """
-    raise NotImplementedError("Not implemented")
+    vision_features, text_features, log_temperature = outputs
+
+    # Scale dot-product similarities by the learned temperature
+    temperature = log_temperature.exp()
+    # logits_per_image[i, j] = similarity(image_i, text_j) / temperature
+    logits_per_image = torch.matmul(vision_features, text_features.T) / temperature  # (N, N)
+    logits_per_text = logits_per_image.T                                              # (N, N)
+
+    # Ground-truth: diagonal entries are the correct pairs
+    batch_size = vision_features.size(0)
+    targets = torch.arange(batch_size, device=vision_features.device)
+
+    # Cross-entropy loss in both directions, averaged
+    loss_image = F.cross_entropy(logits_per_image, targets)
+    loss_text = F.cross_entropy(logits_per_text, targets)
+    loss = (loss_image + loss_text) / 2.0
+
+    return loss
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
