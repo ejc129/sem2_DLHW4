@@ -110,9 +110,9 @@ class VQADatasetForTraining(Dataset):
 def train(
     data_dir: Path | None = None,
     train_dataset_name: str = "train",
-    output_dir: str = "vlm_model",
+    output_dir: str = "vlm_sft",
     num_train_epochs: int = 0.05,  # use only 0.05 epoch for training
-    per_device_train_batch_size: int = 8,
+    per_device_train_batch_size: int = 32,
     gradient_accumulation_steps: int = 4,
     learning_rate: float = 5e-4,
     lora_r: int = 8,
@@ -157,7 +157,7 @@ def train(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=["q_proj", "v_proj"],
+        target_modules="all-linear",
         bias="none",
     )
 
@@ -180,18 +180,12 @@ def train(
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
-        bf16=True if DEVICE == "cuda" else False,
-        
-        lr_scheduler_type="cosine",
-        max_grad_norm=1.0, 
-        warmup_ratio=0.0015,
-        learning_rate=learning_rate,
-
+        report_to="tensorboard",
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        
-        report_to="tensorboard",
+        learning_rate=learning_rate,
+        bf16=True if DEVICE == "cuda" else False,
         logging_steps=1,
         save_strategy="steps",
         save_steps=50,
