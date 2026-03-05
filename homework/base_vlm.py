@@ -19,10 +19,14 @@ class BaseVLM:
         self.model = AutoModelForVision2Seq.from_pretrained(
             checkpoint,
             torch_dtype=torch.bfloat16,
-            _attn_implementation="eager",
+            _attn_implementation="sdpa",
+            trust_remote_code=True,
         ).to(DEVICE)
         self.device = DEVICE
 
+        if hasattr(self.model, "vision_model"):
+          for param in self.model.vision_model.parameters():
+              param.requires_grad = False
     def format_prompt(self, question: str) -> str:
         """
         Format the question into a prompt for the VLM.
